@@ -1,0 +1,65 @@
+#include <Keypad.h> 
+const byte ROWS = 4; 
+const byte COLS = 4; 
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {9, 8, 7, 6}; // Connect to GPIOs 9, 8, 7, 6
+byte colPins[COLS] = {5, 4, 3, 2}; // Connect to GPIOs 5, 4, 3, 2
+
+Keypad keypad = Keypad( makeKeymap(keys), rowPins, colPins, ROWS, COLS );
+
+const int DOOR_LOCK_PIN = 10; // Connect to relay IN pin
+const String CORRECT_PIN = "2667";
+String enteredPin = "";
+const int PIN_LENGTH = 4;
+int incorrectAttempts = 0;
+const int MAX_ATTEMPTS = 3;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(DOOR_LOCK_PIN, OUTPUT);
+  digitalWrite(DOOR_LOCK_PIN, HIGH); //  HIGH keeps relay off (door locked)
+  Serial.println("Door Lock System Ready");
+}
+
+void loop() {
+  char key = keypad.getKey(); 
+
+  if (key) {
+    if (key == '#') {
+      if (enteredPin == CORRECT_PIN) {
+        Serial.println("PIN Correct! Unlocking door...");
+        digitalWrite(DOOR_LOCK_PIN, LOW); // Activate relay (unlock)
+        delay(3000); // Door stays unlocked for 3 seconds
+        digitalWrite(DOOR_LOCK_PIN, HIGH); // Deactivate relay (lock)
+        Serial.println("Door re-locked.");
+        incorrectAttempts = 0; // to Reset attempts
+      } else {
+        Serial.print("Incorrect PIN: ");
+        Serial.println(enteredPin);
+        incorrectAttempts++;
+        if (incorrectAttempts >= MAX_ATTEMPTS) {
+          Serial.println("Too many incorrect attempts! System locked out.");
+          
+        }
+      }
+      enteredPin = ""; 
+    } else if (key == '*') { //  '*' is the "Clear" key
+      enteredPin = "";
+      Serial.println("PIN cleared.");
+    } else { 
+      if (enteredPin.length() < PIN_LENGTH) {
+        enteredPin += key;
+        Serial.print("Entered: ");
+        Serial.println(enteredPin);
+      } else {
+        Serial.println("PIN buffer full. Press # or *.");
+      }
+    }
+  }
+
+}
