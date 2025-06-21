@@ -1,1 +1,98 @@
+#include <WiFi.h>
+#include <WebServer.h>
+// #include <ESP32Servo.h> // if we are using a servo for the lock
 
+// --- WiFi Configuration ---
+const char* ssid = "YOUR_WIFI_SSID";         // <<< we need to Replace with our WiFi network name
+const char* password = "YOUR_WIFI_PASSWORD"; // << need to Replace with your WiFi password
+
+// --- Door Lock Configuration ---
+//  GPIO pin according to our ESP32-CAM for the relay.
+// GPIO 4 
+const int DOOR_LOCK_PIN = 4; // need to Connect relay signal pin to this GPIO
+
+// Defining the state for unlocked and locked.
+//  HIGH is  'off' and LOW is 'on'.
+
+const int UNLOCKED_STATE = LOW;  //  Relay active LOW to unlock
+const int LOCKED_STATE = HIGH;   // Relay active HIGH to lock
+
+WebServer server(80); // this is to Create a web server on port 80
+
+// If we are using a servo for the lock
+// Servo myServo;
+// const int SERVO_UNLOCK_ANGLE = 90; // need to Adjust these angles for our servo
+// const int SERVO_LOCK_ANGLE = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // Initialize the door lock pin
+  pinMode(DOOR_LOCK_PIN, OUTPUT);
+  digitalWrite(DOOR_LOCK_PIN, LOCKED_STATE); // Ensure door is locked on boot
+
+  // If using a servo
+  // myServo.attach(DOOR_LOCK_PIN);
+  // myServo.write(SERVO_LOCK_ANGLE); // Ensure door is locked on boot
+
+  // --- Connect to WiFi ---
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("ESP32-CAM IP Address: ");
+  Serial.println(WiFi.localIP()); 
+
+  // --- Web Server Setup ---
+  server.on("/unlock", handleUnlock);
+  server.on("/lock", handleLock);
+  server.onNotFound(handleNotFound); 
+
+  server.begin(); // Start the web server
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  server.handleClient(); // Must be called continuously to handle incoming requests
+}
+
+// --- Web Server Handlers ---
+
+void handleUnlock() {
+  Serial.println("Received /unlock command");
+  digitalWrite(DOOR_LOCK_PIN, UNLOCKED_STATE); // Set pin state to unlock
+  // If using a servo
+  // myServo.write(SERVO_UNLOCK_ANGLE);
+  server.send(200, "text/plain", "Door Unlocked"); 
+}
+
+void handleLock() {
+  Serial.println("Received /lock command");
+  digitalWrite(DOOR_LOCK_PIN, LOCKED_STATE); // Set pin state to lock
+  // If using a servo
+  // myServo.write(SERVO_LOCK_ANGLE);
+  server.send(200, "text/plain", "Door Locked"); // Send a response back
+}
+
+void handleNotFound() {
+  Serial.println("Unknown request received");
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  for (uint8_t i = 0; i < server.args(); i++) {
+    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+  }
+  server.send(404, "text/plain", message);
+}
