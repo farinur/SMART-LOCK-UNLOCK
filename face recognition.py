@@ -5,7 +5,7 @@ import pyttsx3 # For text-to-speech
 import requests # New: For making HTTP requests to the ESP32-CAM
 import time # To add a small delay if needed
 
-# Replace with the actual IP address of your ESP32-CAM module
+# Replace with the actual IP address of the ESP32-CAM module
 ESP32_CAM_IP = "192.168.1.100" # <<< should be the ESP32-CAM's IP ADDRESS!( this is just for reference)
 
 # Initialize text-to-speech engine
