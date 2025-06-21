@@ -1,27 +1,26 @@
 import cv2
 from simple_facerec import SimpleFacerec
-from cvzone.FaceDetectionModule import FaceDetector 
-import pyttsx3 # For text-to-speech
-import requests # New: For making HTTP requests to the ESP32-CAM
-import time # To add a small delay if needed
+from cvzone.FaceDetectionModule import FaceDetector
+import pyttsx3
+import requests
+import time
+from datetime import datetime  # For logging timestamps
 
-# Replace with the actual IP address of the ESP32-CAM module
-ESP32_CAM_IP = "192.168.1.100" # <<< should be the ESP32-CAM's IP ADDRESS!( this is just for reference)
+# --- Configuration ---
+ESP32_CAM_IP = "192.168.1.100"  # <<< must Replace with your ESP32 IP
 
 # Initialize text-to-speech engine
 engine = pyttsx3.init()
 
-# Initialize Face Detector 
+# Initialize Face Detector
 detector = FaceDetector()
 
 # Encode faces from a folder
 sfr = SimpleFacerec()
 sfr.load_encoding_images("D:/python-opencv/face _recognition/images/")
 
-# Load Camera 
+# Load Camera
 cap = cv2.VideoCapture(1)
-
-# Check if camera opened successfully
 if not cap.isOpened():
     print("Error: Could not open video stream.")
     exit()
@@ -29,6 +28,16 @@ if not cap.isOpened():
 # Flag to track if the door is currently unlocked
 door_unlocked = False
 
+# --- Logging functions 🆕 ---
+def log_failed_attempt():
+    with open("failed_attempts_log.txt", "a") as log_file:
+        log_file.write(f"[{datetime.now()}] ⚠️ Unknown face detected - Access Denied\n")
+
+def log_success(name):
+    with open("access_log.txt", "a") as log_file:
+        log_file.write(f"[{datetime.now()}] ✅ Access granted to {name}\n")
+
+# --- Main loop ---
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -47,13 +56,15 @@ while True:
 
         if name != "Unknown":
             known_face_detected_in_frame = True
+            log_success(name)  #  Log success
+        else:
+            log_failed_attempt()  # Log failure
 
     # --- Door Lock/Unlock Logic and Voice Feedback ---
     if known_face_detected_in_frame:
-        if not door_unlocked: 
+        if not door_unlocked:
             try:
-                # Send HTTP GET request to ESP32-CAM to unlock
-                requests.get(f"http://{ESP32_CAM_IP}/unlock", timeout=0.5) # Small timeout for quick response
+                requests.get(f"http://{ESP32_CAM_IP}/unlock", timeout=0.5)
                 engine.say("Welcome")
                 engine.runAndWait()
                 print("Welcome - Door Unlocked")
@@ -65,13 +76,8 @@ while True:
             except Exception as e:
                 print(f"An unexpected error occurred while communicating with ESP32-CAM: {e}")
     else:
-        # Give a small buffer before locking if no one is detected.
-        # This prevents immediate locking if someone briefly moves out of frame.
-        # time.sleep(0.1) # small delay before locking
-
         if door_unlocked:
             try:
-                # Send HTTP GET request to ESP32-CAM to lock
                 requests.get(f"http://{ESP32_CAM_IP}/lock", timeout=0.5)
                 engine.say("Access denied")
                 engine.runAndWait()
@@ -85,8 +91,11 @@ while True:
                 print(f"An unexpected error occurred while communicating with ESP32-CAM: {e}")
 
     cv2.imshow("Face Recognition Door System", frame)
-     key = cv2.waitKey(1)
-    if key == 27:  # Press 'Esc' to exit
+
+    key = cv2.waitKey(1)
+    if key == 27: #press esc to exit
         break
+
 cap.release()
 cv2.destroyAllWindows()
+
