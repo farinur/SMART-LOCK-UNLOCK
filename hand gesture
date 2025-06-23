@@ -1,0 +1,188 @@
+import cv2
+import mediapipe as mp
+import pyttsx3
+import requests
+import time
+from datetime import datetime
+import numpy as np
+
+ESP32_CAM_IP = "192.168.1.100"  
+ESP32_CAM_STREAM_URL = f"http://{ESP32_CAM_IP}:81/stream" # URL for the video stream
+
+# Initialize text-to-speech engine
+engine = pyttsx3.init()
+def speak(text):
+    """Speaks the given text."""
+    engine.say(text)
+    engine.runAndWait()
+
+# Initialize MediaPipe Hands
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+mp_draw = mp.solutions.drawing_utils
+
+# Load Camera (using ESP32-CAM stream)
+cap = cv2.VideoCapture(ESP32_CAM_STREAM_URL)
+if not cap.isOpened():
+    print(f"Error: Could not open video stream from {ESP32_CAM_STREAM_URL}. Make sure ESP32-CAM is online and serving stream.")
+    exit()
+
+# Flag to track if the door is currently unlocked 
+door_unlocked = False
+
+# Cooldown for gesture detection to prevent rapid toggling
+LAST_GESTURE_TIME = 0
+GESTURE_COOLDOWN_SECONDS = 3 # Only detect a new gesture every 3 seconds
+
+# --- Door Control Functions 
+def unlock_door():
+    """Sends an HTTP GET request to unlock the door via ESP32-CAM."""
+    global door_unlocked
+    if not door_unlocked:
+        try:
+            requests.get(f"http://{ESP32_CAM_IP}/unlock", timeout=1)
+            speak("Welcome. Door Unlocked.")
+            print("Command Sent: Door Unlocked")
+            door_unlocked = True
+            return True
+        except requests.exceptions.ConnectionError:
+            print(f"Error: Could not connect to ESP32-CAM at {ESP32_CAM_IP}. Is it online?")
+            speak("Connection error to door.")
+        except requests.exceptions.Timeout:
+            print(f"Warning: Connection to ESP32-CAM at {ESP32_CAM_IP} timed out.")
+            speak("Door connection timed out.")
+        except Exception as e:
+            print(f"An unexpected error occurred while communicating with ESP32-CAM: {e}")
+            speak("An error occurred.")
+    return False
+
+def lock_door():
+    """Sends an HTTP GET request to lock the door via ESP32-CAM."""
+    global door_unlocked
+    if door_unlocked: # Only try to lock if currently unlocked
+        try:
+            requests.get(f"http://{ESP32_CAM_IP}/lock", timeout=1)
+            speak("Access denied. Door Locked.") 
+            print("Command Sent: Door Locked")
+            door_unlocked = False
+            return True
+        except requests.exceptions.ConnectionError:
+            print(f"Error: Could not connect to ESP32-CAM at {ESP32_CAM_IP}. Is it online?")
+            speak("Connection error to door.")
+        except requests.exceptions.Timeout:
+            print(f"Warning: Connection to ESP32-CAM at {ESP32_CAM_IP} timed out.")
+            speak("Door connection timed out.")
+        except Exception as e:
+            print(f"An unexpected error occurred while communicating with ESP32-CAM: {e}")
+            speak("An error occurred.")
+    return False
+
+def get_hand_landmarks_dict(landmarks):
+    """Converts MediaPipe landmarks to a dictionary for easier access by name."""
+    lm_dict = {}
+    for id, lm in enumerate(landmarks.landmark):
+        # Scale landmarks to frame size for pixel coordinates
+        h, w, c = frame.shape
+        cx, cy = int(lm.x * w), int(lm.y * h)
+        lm_dict[mp_hands.HandLandmark(id).name] = (cx, cy)
+    return lm_dict
+
+def detect_thumb_gesture(hand_landmarks_dict):
+    """
+    Detects 'Thumbs Up' or 'Thumbs Down' based on hand landmarks.
+    Requires relative positions of thumb tip and other finger tips/MCPs.
+    """
+    thumb_tip_y = hand_landmarks_dict[mp_hands.HandLandmark.THUMB_TIP.name][1]
+    thumb_ip_y = hand_landmarks_dict[mp_hands.HandLandmark.THUMB_IP.name][1] # Interphalangeal joint
+    index_mcp_y = hand_landmarks_dict[mp_hands.HandLandmark.INDEX_FINGER_MCP.name][1] # Metacarpophalangeal joint
+    middle_mcp_y = hand_landmarks_dict[mp_hands.HandLandmark.MIDDLE_FINGER_MCP.name][1]
+    ring_mcp_y = hand_landmarks_dict[mp_hands.HandLandmark.RING_FINGER_MCP.name][1]
+    pinky_mcp_y = hand_landmarks_dict[mp_hands.HandLandmark.PINKY_MCP.name][1]
+
+    # Check if other fingers are generally curled
+
+    fingers_curled = (
+        hand_landmarks_dict[mp_hands.HandLandmark.INDEX_FINGER_TIP.name][1] > index_mcp_y and
+        hand_landmarks_dict[mp_hands.HandLandmark.MIDDLE_FINGER_TIP.name][1] > middle_mcp_y and
+        hand_landmarks_dict[mp_hands.HandLandmark.RING_FINGER_TIP.name][1] > ring_mcp_y and
+        hand_landmarks_dict[mp_hands.HandLandmark.PINKY_TIP.name][1] > pinky_mcp_y
+    )
+
+    # Thumbs Up
+    if thumb_tip_y < thumb_ip_y and fingers_curled:
+        # Check if thumb is generally pointing up relative to the wrist area
+        wrist_y = hand_landmarks_dict[mp_hands.HandLandmark.WRIST.name][1]
+        if thumb_tip_y < wrist_y - 30: 
+            return "Thumbs Up"
+
+    # Thumbs Down
+    if thumb_tip_y > thumb_ip_y and fingers_curled:
+        # Check if thumb is generally pointing down relative to the wrist area
+        wrist_y = hand_landmarks_dict[mp_hands.HandLandmark.WRIST.name][1]
+        if thumb_tip_y > wrist_y + 30: # Threshold for "down"
+            return "Thumbs Down"
+
+    return "No Gesture"
+
+
+# --- Main loop ---
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Failed to grab frame. Reconnecting...")
+        cap = cv2.VideoCapture(ESP32_CAM_STREAM_URL) # Attempt to reconnect
+        time.sleep(1) # Wait a bit before trying again
+        continue
+
+    # Flip the frame horizontally for a more natural mirror effect
+    frame = cv2.flip(frame, 1)
+
+    # Convert the BGR image to RGB.
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # Process the image and find hands
+    result = hands.process(rgb_frame)
+
+    current_gesture = "None"
+    if result.multi_hand_landmarks:
+        for hand_landmarks in result.multi_hand_landmarks:
+          
+            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+            # Convert landmarks to a dictionary for easier access
+            hand_lm_dict = get_hand_landmarks_dict(hand_landmarks)
+
+            # Detect gesture
+            gesture = detect_thumb_gesture(hand_lm_dict)
+            if gesture != "No Gesture":
+                current_gesture = gesture
+
+    # --- Gesture-based Door Control ---
+    current_time = time.time()
+    if current_time - LAST_GESTURE_TIME > GESTURE_COOLDOWN_SECONDS:
+        if current_gesture == "Thumbs Up":
+            if lock_door():
+                LAST_GESTURE_TIME = current_time
+        elif current_gesture == "Thumbs Down":
+            if unlock_door():
+                LAST_GESTURE_TIME = current_time
+
+    # Display gesture status on screen
+    cv2.putText(frame, f"Gesture: {current_gesture}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.putText(frame, f"Door Unlocked: {door_unlocked}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+
+    cv2.imshow("Hand Gesture Door Control", frame)
+
+    key = cv2.waitKey(1)
+    if key == 27: # Press ESC to exit
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+hands.close()
