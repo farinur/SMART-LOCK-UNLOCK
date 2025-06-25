@@ -1,0 +1,11 @@
+import cv2
+import mediapipe as mp
+import speech_recognition as sr
+import pyttsx3
+import requests
+import time
+from datetime import datetime
+import threading
+import queue # For safe inter-thread communication
+import numpy as np
+from flask import Flask, request # For the keypad server
