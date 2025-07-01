@@ -122,3 +122,90 @@ def send_lock_command():
             print("Door is already locked. No lock command sent.")
             speak("Door is already locked.")
     return False
+def send_lock_command():
+    """Sends an HTTP GET request to lock the door via ESP32-CAM."""
+    global door_unlocked
+    with door_state_lock: # Protect shared variable
+        if door_unlocked: # Only try to lock if currently unlocked
+            try:
+                # When testing on laptop, these requests will likely fail
+                requests.get(f"http://{ESP32_CAM_IP}/lock", timeout=0.5) # Reduced timeout for quicker local test error
+                speak("Access denied. Door is locked.") # Or "Door is locked"
+                print("ESP32 Command Sent: Door Locked")
+                door_unlocked = False
+                return True
+            except requests.exceptions.ConnectionError:
+                print(f"Error: Could not connect to ESP32-CAM at {ESP32_CAM_IP}. (Expected during local testing).")
+                speak("Connection error to door. Cannot lock.")
+            except requests.exceptions.Timeout:
+                print(f"Warning: Connection to ESP32-CAM at {ESP32_CAM_IP} timed out. (Expected during local testing).")
+                speak("Door connection timed out. Cannot lock.")
+            except Exception as e:
+                print(f"An unexpected error occurred while communicating with ESP32-CAM: {e}")
+                speak("An error occurred while trying to lock.")
+        else:
+            print("Door is already locked. No lock command sent.")
+            speak("Door is already locked.")
+    return False
+
+# --- Initializations for all modules ---
+# Face Recognition (simple-facerec will be imported and sfr initialized later)
+from simple_facerec import SimpleFacerec # Import here to allow dynamic path loading
+sfr = None # Placeholder, initialized in main
+
+# Hand Gesture Recognition
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+mp_draw = mp.solutions.drawing_utils
+
+# Speech Recognition
+recognizer = sr.Recognizer()
+
+# Flask App for Keypad
+app = Flask(__name__)
+keypad_input_buffer = []
+keypad_buffer_lock = threading.Lock() # Protects keypad_input_buffer
+
+
+
+# 1. Flask Server for Keypad Input
+@app.route('/keypad', methods=['POST'])
+def receive_keypad_input():
+    global keypad_input_buffer
+    if request.is_json:
+        data = request.get_json()
+        key = data.get('key')
+        if key is not None:
+            print(f"Keypad: Received key from ESP32: {key}")
+            with keypad_buffer_lock: # Protect buffer modification
+                if key == '#': # Assuming '#' is your "Enter" or "Submit" key
+                    entered_pin = "".join(keypad_input_buffer)
+                    keypad_input_queue.put(("PIN_ENTERED", entered_pin))
+                    keypad_input_buffer.clear()
+                    speak("Pin submitted.")
+                elif key == '*': # Assuming '*' is your "Clear" key
+                    keypad_input_buffer.clear()
+                    speak("Cleared.")
+                    print("Keypad buffer cleared.")
+                elif len(keypad_input_buffer) < len(AUTHORIZED_PIN): # Max PIN length based on authorized PIN
+                    keypad_input_buffer.append(str(key))
+                    print(f"Keypad: Current PIN buffer: {''.join(keypad_input_buffer)}")
+                else:
+                    speak("Pin buffer full.")
+                    print("Keypad: PIN buffer full, ignoring new digit.")
+            return {"status": "success"}, 200
+        else:
+            return {"status": "error", "message": "No 'key' found in JSON"}, 400
+    else:
+        return {"status": "error", "message": "Request must be JSON"}, 400
+
+def run_flask_app_thread():
+ 
+    print(f"Flask server will attempt to listen on http://{PYTHON_SERVER_IP}:{PYTHON_SERVER_PORT}")
+    # Python PC's firewall allows incoming connections on PYTHON_SERVER_PORT
+    app.run(host='0.0.0.0', port=PYTHON_SERVER_PORT, debug=False, use_reloader=False)
