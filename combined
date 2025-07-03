@@ -209,3 +209,43 @@ def run_flask_app_thread():
     print(f"Flask server will attempt to listen on http://{PYTHON_SERVER_IP}:{PYTHON_SERVER_PORT}")
     # Python PC's firewall allows incoming connections on PYTHON_SERVER_PORT
     app.run(host='0.0.0.0', port=PYTHON_SERVER_PORT, debug=False, use_reloader=False)
+
+# 2. Speech Recognition
+def speech_recognition_loop():
+    """Continuously listens for voice commands."""
+    while True:
+        with sr.Microphone() as source:
+            print("Speech: Listening for command...")
+            speak("Please say your command.")
+            try:
+                recognizer.adjust_for_ambient_noise(source)
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=3)
+            except sr.WaitTimeoutError:
+                print("Speech: No speech detected within timeout.")
+                time.sleep(0.5) # Small delay before re-listening
+                continue
+            except Exception as e:
+                print(f"Speech: Error capturing audio: {e}")
+                time.sleep(1)
+                continue
+
+        try:
+            command = recognizer.recognize_google(audio).upper()
+            print(f"Speech: You said: '{command}'")
+            if command == VOICE_UNLOCK_COMMAND:
+                voice_command_queue.put(("UNLOCK", "Voice User"))
+            elif command == VOICE_LOCK_COMMAND:
+                voice_command_queue.put(("LOCK", "Voice User"))
+            else:
+                speak("Incorrect voice command.")
+                log_failed_attempt(method="Voice Command", reason=f"Incorrect command: {command}")
+        except sr.UnknownValueError:
+            print("Speech: Google Speech Recognition could not understand audio.")
+            speak("Sorry, I did not understand that.")
+            log_failed_attempt(method="Voice Recognition", reason="Unclear speech")
+        except sr.RequestError as e:
+            print(f"Speech: Could not request results from Google Speech Recognition service; {e}")
+            speak("Speech recognition service is unavailable.")
+        except Exception as e:
+            print(f"Speech: An unexpected error occurred during speech recognition: {e}")
+        time.sleep(0.5) 
