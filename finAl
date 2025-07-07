@@ -1,0 +1,477 @@
+import cv2
+import mediapipe as mp
+import speech_recognition as sr
+import pyttsx3
+import requests
+import time
+from datetime import datetime
+import threading
+import queue # For safe inter-thread communication
+import numpy as np
+from flask import Flask, request # For the keypad server
+import socket # To help find local IP
+from simple_facerec import SimpleFacerec 
+
+ESP32_CAM_IP = "192.168.1.100"  # <<< REPLACE WITH our ESP32-CAM IP FOR DEPLOYMENT
+ESP32_CAM_STREAM_URL = f"http://{ESP32_CAM_IP}:81/stream" # URL for the video stream from ESP32
+
+# gets the ip address
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1' # Fallback to localhost if no network connection
+    finally:
+        s.close()
+    return IP
+
+PYTHON_SERVER_IP = get_local_ip() 
+PYTHON_SERVER_PORT = 5000 # Port for the Flask server to receive keypad input
+AUTHORIZED_PIN = "2667" # authorized PIN
+VOICE_UNLOCK_COMMAND = "BLACK"
+VOICE_LOCK_COMMAND = "YELLOW"
+FACE_IMAGES_PATH = "C:/Users/asus/OneDrive/Desktop/SmartDoorProjet/images/" 
+LOG_COOLDOWN_SECONDS = 5 # Log access/denial only once every 5 seconds
+NO_FACE_TIMEOUT_SECONDS = 10 # If no faces detected for this long, trigger fallback prompt
+BRIGHTNESS_THRESHOLD = 50 
+GESTURE_COOLDOWN_SECONDS = 3 # Only detects a new gesture every 3 seconds
+
+# Global State Variables 
+# multiple threads to prevent race conditions
+door_unlocked = False
+door_state_lock = threading.Lock() # Protects 'door_unlocked'
+
+# Queues for inter-thread communication
+face_recognition_queue = queue.Queue() 
+keypad_input_queue = queue.Queue()    
+gesture_command_queue = queue.Queue() 
+voice_command_queue = queue.Queue()    
+
+# Speech Engine and Lock 
+engine = pyttsx3.init()
+speech_lock = threading.Lock() # Ensures only one speech output at a time
+
+def speak(text):
+    with speech_lock:
+        engine.say(text)
+        engine.runAndWait()
+
+# --- Logging functions ---
+last_access_log_time = 0
+last_failed_log_time = 0
+
+def log_failed_attempt(method="Unknown", reason=""):
+    global last_failed_log_time
+    current_time = time.time()
+    if current_time - last_failed_log_time > LOG_COOLDOWN_SECONDS:
+        with open("failed_attempts_log.txt", "a") as log_file:
+            log_file.write(f"[{datetime.now()}] ⚠️ Access Denied via {method} - Reason: {reason}\n")
+        print(f"Logged: Access Denied via {method} - Reason: {reason}")
+        last_failed_log_time = current_time
+
+def log_success(name="Authorized User", method="Unknown"):
+    global last_access_log_time
+    current_time = time.time()
+    if current_time - last_access_log_time > LOG_COOLDOWN_SECONDS:
+        with open("access_log.txt", "a") as log_file:
+            log_file.write(f"[{datetime.now()}] ✅ Access granted to {name} via {method}\n")
+        print(f"Logged: Access granted to {name} via {method}")
+        last_access_log_time = current_time
+
+# Door Control Functions
+def send_unlock_command():
+    """Sends an HTTP GET request to unlock the door via ESP32-CAM."""
+    global door_unlocked
+    with door_state_lock: 
+        if not door_unlocked:
+            try:
+                requests.get(f"http://{ESP32_CAM_IP}/unlock", timeout=0.5) 
+                speak("Welcome. Door is unlocked.")
+                print("ESP32 Command Sent: Door Unlocked")
+                door_unlocked = True
+                return True
+            except requests.exceptions.ConnectionError:
+                print(f"Error: Could not connect to ESP32-CAM at {ESP32_CAM_IP}.")
+                speak("Connection error to door. Cannot unlock.")
+            except requests.exceptions.Timeout:
+                print(f"Warning: Connection to ESP32-CAM at {ESP32_CAM_IP} timed out.")
+                speak("Door connection timed out. Cannot unlock.")
+            except Exception as e:
+                print(f"An unexpected error occurred while communicating with ESP32-CAM: {e}")
+                speak("An error occurred while trying to unlock.")
+        else:
+            print("Door is already unlocked. No unlock command sent.")
+            speak("Door is already unlocked.")
+    return False
+
+def send_lock_command():
+    """Sends an HTTP GET request to lock the door via ESP32-CAM."""
+    global door_unlocked
+    with door_state_lock: 
+        if door_unlocked:
+            try:
+                requests.get(f"http://{ESP32_CAM_IP}/lock", timeout=0.5) 
+                speak("Access denied. Door is locked.") 
+                print("ESP32 Command Sent: Door Locked")
+                door_unlocked = False
+                return True
+            except requests.exceptions.ConnectionError:
+                print(f"Error: Could not connect to ESP32-CAM at {ESP32_CAM_IP}.")
+                speak("Connection error to door. Cannot lock.")
+            except requests.exceptions.Timeout:
+                print(f"Warning: Connection to ESP32-CAM at {ESP32_CAM_IP} timed out.")
+                speak("Door connection timed out. Cannot lock.")
+            except Exception as e:
+                print(f"An unexpected error occurred while communicating with ESP32-CAM: {e}")
+                speak("An error occurred while trying to lock.")
+        else:
+            print("Door is already locked. No lock command sent.")
+            speak("Door is already locked.")
+    return False
+
+# Initializations for all modules
+sfr = None # Placeholder
+
+# Hand Gesture Recognition
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+mp_draw = mp.solutions.drawing_utils
+
+# Speech Recognition
+recognizer = sr.Recognizer()
+
+# Flask App for Keypad
+app = Flask(__name__)
+keypad_input_buffer = []
+keypad_buffer_lock = threading.Lock() # Protects keypad_input_buffer
+
+# Thread Functions
+# 1. Flask Server for Keypad Input
+@app.route('/keypad', methods=['POST'])
+def receive_keypad_input():
+    global keypad_input_buffer
+    if request.is_json:
+        data = request.get_json()
+        key = data.get('key')
+        if key is not None:
+            print(f"Keypad: Received key from ESP32: {key}")
+            with keypad_buffer_lock: 
+                if key == '#': # '#' is"Enter" or "Submit" key
+                    entered_pin = "".join(keypad_input_buffer)
+                    keypad_input_queue.put(("PIN_ENTERED", entered_pin))
+                    keypad_input_buffer.clear()
+                    speak("Pin submitted.")
+                elif key == '*': # '*' is your "Clear" key
+                    keypad_input_buffer.clear()
+                    speak("Cleared.")
+                    print("Keypad buffer cleared.")
+                elif len(keypad_input_buffer) < len(AUTHORIZED_PIN): 
+                    keypad_input_buffer.append(str(key))
+                    print(f"Keypad: Current PIN buffer: {''.join(keypad_input_buffer)}")
+                else:
+                    speak("Pin buffer full.")
+                    print("Keypad: PIN buffer full, ignoring new digit.")
+            return {"status": "success"}, 200
+        else:
+            return {"status": "error", "message": "No 'key' found in JSON"}, 400
+    else:
+        return {"status": "error", "message": "Request must be JSON"}, 400
+
+def run_flask_app_thread():
+    print(f"Flask server will attempt to listen on http://{PYTHON_SERVER_IP}:{PYTHON_SERVER_PORT}")
+   
+    app.run(host='0.0.0.0', port=PYTHON_SERVER_PORT, debug=False, use_reloader=False)
+
+# 2. Speech Recognition
+def speech_recognition_loop():
+    while True:
+        with sr.Microphone() as source:
+            print("Speech: Listening for command...")
+            speak("Please say your command.")
+            try:
+                recognizer.adjust_for_ambient_noise(source)
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=3)
+            except sr.WaitTimeoutError:
+                print("Speech: No speech detected within timeout.")
+                time.sleep(0.5) # Small delay before re-listening
+                continue
+            except Exception as e:
+                print(f"Speech: Error capturing audio: {e}")
+                time.sleep(1)
+                continue
+
+        try:
+            command = recognizer.recognize_google(audio).upper()
+            print(f"Speech: You said: '{command}'")
+            if command == VOICE_UNLOCK_COMMAND:
+                voice_command_queue.put(("UNLOCK", "Voice User"))
+            elif command == VOICE_LOCK_COMMAND:
+                voice_command_queue.put(("LOCK", "Voice User"))
+            else:
+                speak("Incorrect voice command.")
+                log_failed_attempt(method="Voice Command", reason=f"Incorrect command: {command}")
+        except sr.UnknownValueError:
+            print("Speech: Google Speech Recognition could not understand audio.")
+            speak("Sorry, I did not understand that.")
+            log_failed_attempt(method="Voice Recognition", reason="Unclear speech")
+        except sr.RequestError as e:
+            print(f"Speech: Could not request results from Google Speech Recognition service; {e}")
+            speak("Speech recognition service is unavailable.")
+        except Exception as e:
+            print(f"Speech: An unexpected error occurred during speech recognition: {e}")
+        time.sleep(0.5) # Delay before next listen cycle
+
+# 3. Hand Gesture Recognition Functions
+def get_hand_landmarks_dict(landmarks, frame_shape):
+    lm_dict = {}
+    h, w, c = frame_shape
+    for id, lm in enumerate(landmarks.landmark):
+        cx, cy = int(lm.x * w), int(lm.y * h)
+        lm_dict[mp_hands.HandLandmark(id).name] = (cx, cy)
+    return lm_dict
+
+def detect_thumb_gesture(hand_landmarks_dict):
+    """Detects 'Thumbs Up' or 'Thumbs Down' based on hand landmarks."""
+    thumb_tip_y = hand_landmarks_dict[mp_hands.HandLandmark.THUMB_TIP.name][1]
+    thumb_ip_y = hand_landmarks_dict[mp_hands.HandLandmark.THUMB_IP.name][1]
+    index_mcp_y = hand_landmarks_dict[mp_hands.HandLandmark.INDEX_FINGER_MCP.name][1]
+    middle_mcp_y = hand_landmarks_dict[mp_hands.HandLandmark.MIDDLE_FINGER_MCP.name][1]
+    ring_mcp_y = hand_landmarks_dict[mp_hands.HandLandmark.RING_FINGER_MCP.name][1]
+    pinky_mcp_y = hand_landmarks_dict[mp_hands.HandLandmark.PINKY_MCP.name][1]
+
+    # Check if other fingers are curled
+    fingers_curled = (
+        hand_landmarks_dict[mp_hands.HandLandmark.INDEX_FINGER_TIP.name][1] > index_mcp_y and
+        hand_landmarks_dict[mp_hands.HandLandmark.MIDDLE_FINGER_TIP.name][1] > middle_mcp_y and
+        hand_landmarks_dict[mp_hands.HandLandmark.RING_FINGER_TIP.name][1] > ring_mcp_y and
+        hand_landmarks_dict[mp_hands.HandLandmark.PINKY_TIP.name][1] > pinky_mcp_y
+    )
+
+    wrist_y = hand_landmarks_dict[mp_hands.HandLandmark.WRIST.name][1]
+
+    # Thumbs Up: 
+    if thumb_tip_y < thumb_ip_y and fingers_curled:
+        if thumb_tip_y < wrist_y - 30: # Threshold for "up"
+            return "Thumbs Up"
+
+    # Thumbs Down: 
+    if thumb_tip_y > thumb_ip_y and fingers_curled:
+        if thumb_tip_y > wrist_y + 30: # Threshold for "down"
+            return "Thumbs Down"
+
+    return "No Gesture"
+
+# Main Thread 
+if __name__ == "__main__":
+    # Initializing face recognizer
+    sfr = SimpleFacerec()
+    try:
+        sfr.load_encoding_images(FACE_IMAGES_PATH)
+        print(f"Face encodings loaded from: {FACE_IMAGES_PATH}")
+    except Exception as e:
+        print(f"Error loading face encodings: {e}. Please ensure path is correct and images exist.")
+        speak("Failed to load face data. Face recognition will be disabled.")
+        sfr = None # Disable face recognition if loading fails
+
+    # Initialize Camera 
+    cap = cv2.VideoCapture(0) 
+    # For actual ESP32 deployment, we need change to:
+    # cap = cv2.VideoCapture(ESP32_CAM_STREAM_URL)
+
+    if not cap.isOpened():
+        print("Error: Could not open video stream. Please check if your webcam is connected or in use, or if the camera index (0) is correct.")
+        speak("Failed to open camera. Exiting.")
+        exit()
+
+    # Start independent threads
+    flask_thread = threading.Thread(target=run_flask_app_thread)
+    flask_thread.daemon = True
+    flask_thread.start()
+    print(f"Flask server started on http://{PYTHON_SERVER_IP}:{PYTHON_SERVER_PORT}")
+
+    speech_thread = threading.Thread(target=speech_recognition_loop)
+    speech_thread.daemon = True
+    speech_thread.start()
+    print("Speech recognition thread started.")
+
+    # Variables for main loop logic
+    last_face_detection_time = time.time()
+    last_gesture_time = 0 # Cooldown for gestures
+    fallback_prompt_given = False # To avoid spamming fallback message
+    current_face_status = False # True if a known face was detected in current frame
+    previous_face_status = False # True if a known face was detected in previous frame
+
+    print("Smart Door System running. Press ESC to exit.")
+    print("Awaiting input from Face Recognition, Keypad, Speech, or Gesture...")
+    print(f"Commands: Voice '{VOICE_UNLOCK_COMMAND}' (unlock), Voice '{VOICE_LOCK_COMMAND}' (lock)")
+    print(f"Keypad PIN: '{AUTHORIZED_PIN}' (followed by # to submit)")
+    print("Gestures: Thumbs Up (lock), Thumbs Down (unlock)")
+
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Main: Error: Failed to grab frame. Attempting to reconnect camera...")
+            cap = cv2.VideoCapture(0) # to reconnect local webcam
+            # cap = cv2.VideoCapture(ESP32_CAM_STREAM_URL) # For ESP32 deployment
+            time.sleep(1)
+            continue
+
+        frame = cv2.flip(frame, 1) # Flip for natural mirror effect
+
+        # Face Recognition & Gesture Detection (Main Thread) 
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # Convert for MediaPipe & SimpleFacerec
+
+        # 1. Face Recognition
+        face_locations, face_names = [], []
+        if sfr: 
+            face_locations, face_names = sfr.detect_known_faces(frame)
+
+        current_face_status = False # Reset
+        for face_loc, name in zip(face_locations, face_names):
+            y1, x2, y2, x1 = face_loc[0], face_loc[1], face_loc[2], face_loc[3]
+            cv2.putText(frame, name, (x1, y1 - 10), cv2.FONT_HERSHEY_DUPLEX, 1, (0, 0, 200), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 200), 4)
+            if name != "Unknown":
+                current_face_status = True
+                face_recognition_queue.put(("UNLOCK", name)) # successful face recognition
+                last_face_detection_time = time.time() #  timer resets if a known face is seen
+
+        # 2. Hand Gesture Recognition
+        current_gesture = "None"
+        mp_results = hands.process(rgb_frame) # Process for hands
+        if mp_results.multi_hand_landmarks:
+            for hand_landmarks in mp_results.multi_hand_landmarks:
+                mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                hand_lm_dict = get_hand_landmarks_dict(hand_landmarks, frame.shape)
+                gesture = detect_thumb_gesture(hand_lm_dict)
+                if gesture != "No Gesture":
+                    current_gesture = gesture
+        current_time = time.time()
+        if current_time - last_gesture_time > GESTURE_COOLDOWN_SECONDS:
+            if current_gesture == "Thumbs Up":
+                gesture_command_queue.put(("LOCK", "Gesture User"))
+                last_gesture_time = current_time
+            elif current_gesture == "Thumbs Down":
+                gesture_command_queue.put(("UNLOCK", "Gesture User"))
+                last_gesture_time = current_time
+
+        # Fallback Logic 
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        average_brightness = np.mean(gray_frame)
+
+        camera_issue_detected = False
+        if (len(face_locations) == 0 or not current_face_status) and (time.time() - last_face_detection_time > NO_FACE_TIMEOUT_SECONDS):
+            camera_issue_detected = True
+            if not fallback_prompt_given:
+                speak("No clear face detected for a while. Please use keypad, voice command, or gestures.")
+                print("Main: Fallback triggered: No faces detected or unknown.")
+                fallback_prompt_given = True
+        elif average_brightness < BRIGHTNESS_THRESHOLD:
+            camera_issue_detected = True
+            if not fallback_prompt_given:
+                speak("Low lighting detected. Please use keypad, voice command, or gestures.")
+                print(f"Main: Fallback triggered: Low lighting (Brightness: {average_brightness:.2f}).")
+                fallback_prompt_given = True
+        else: # Camera is fine 
+            if fallback_prompt_given:
+                speak("Face recognition conditions are clear now.")
+                fallback_prompt_given = False
+
+        # Decision Fusion (One clear "open" or "deny") 
+        unlock_requested = False
+        lock_requested = False
+        initiating_user = "System"
+        initiating_method = "Automatic"
+
+        # Check all queues for commands
+        while not face_recognition_queue.empty():
+            cmd, name = face_recognition_queue.get()
+            if cmd == "UNLOCK":
+                unlock_requested = True
+                initiating_user = name
+                initiating_method = "Face Recognition"
+
+        while not keypad_input_queue.empty():
+            cmd, pin_entered = keypad_input_queue.get()
+            if cmd == "PIN_ENTERED":
+                if pin_entered == AUTHORIZED_PIN:
+                    unlock_requested = True
+                    initiating_user = "Keypad User"
+                    initiating_method = "Keypad PIN"
+                else:
+                    speak("Incorrect PIN.")
+                    log_failed_attempt(method="Keypad PIN", reason="Incorrect PIN")
+
+        while not gesture_command_queue.empty():
+            cmd, name = gesture_command_queue.get()
+            if cmd == "UNLOCK":
+                unlock_requested = True
+                initiating_user = name
+                initiating_method = "Hand Gesture"
+            elif cmd == "LOCK":
+                lock_requested = True
+                initiating_user = name
+                initiating_method = "Hand Gesture"
+
+        while not voice_command_queue.empty():
+            cmd, name = voice_command_queue.get()
+            if cmd == "UNLOCK":
+                unlock_requested = True
+                initiating_user = name
+                initiating_method = "Voice Command"
+            elif cmd == "LOCK":
+                lock_requested = True
+                initiating_user = name
+                initiating_method = "Voice Command"
+
+        # Execute decision
+        if unlock_requested:
+            if send_unlock_command():
+                log_success(initiating_user, method=initiating_method)
+                # Resets fallback prompt if successful unlock 
+                fallback_prompt_given = False
+        elif lock_requested:
+            if send_lock_command():
+                log_failed_attempt(method=initiating_method, reason="Lock command received / No authorized presence")
+                # Reset fallback prompt if a lock command 
+                fallback_prompt_given = False
+        else: 
+            with door_state_lock:
+                if not current_face_status and previous_face_status and door_unlocked:
+                    if send_lock_command():
+                        log_failed_attempt(method="Auto-Lock", reason="No authorized presence detected after unlock")
+
+
+        previous_face_status = current_face_status # Update for next frame
+
+        # Displays current status on the OpenCV window
+        status_text_door = "LOCKED"
+        with door_state_lock:
+            if door_unlocked:
+                status_text_door = "UNLOCKED"
+
+        cv2.putText(frame, f"Door Status: {status_text_door}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(frame, f"Brightness: {average_brightness:.0f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+        cv2.putText(frame, f"Gesture: {current_gesture}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 1)
+        with keypad_buffer_lock:
+            cv2.putText(frame, f"Keypad Buffer: {''.join(keypad_input_buffer)}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+
+        cv2.imshow("Smart Door System - Fariha's Software", frame)
+
+        key = cv2.waitKey(1)
+        if key == 27: # Press ESC to exit
+            break
+        
+    cap.release()
+    cv2.destroyAllWindows()
+    hands.close()
+    print("Smart Door System terminated.")
